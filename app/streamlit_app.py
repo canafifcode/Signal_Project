@@ -47,7 +47,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from kspace_store.store import KSpaceStore          # noqa: E402
-from mri_sim import cs, kspace as ks, metrics, motion, noise, roi  # noqa: E402
+from mri_sim import cs, denoise, kspace as ks, metrics, motion, noise, roi  # noqa: E402
+from mri_sim import motion_correction as mcorr                             # noqa: E402
 
 # The presentation layer lives next to this file.  puts the
 # script's directory on the path, but being explicit keeps imports working
@@ -201,6 +202,57 @@ def acquire_with_motion(
         metrics.compute_metrics(image, reconstruction),
         displacements,
     )
+
+
+@st.cache_data(show_spinner=False)
+def spoke_index_map(shape: tuple[int, int], ratio: float) -> np.ndarray:
+    """Cached: the spoke-count binary search is the slow part of radial."""
+    return motion.draw_spokes_indexed(shape, motion.n_spokes_for_ratio(shape, ratio))
+
+
+def motion_undo(kind: str, shape: tuple[int, int], ratio: float):
+    """
+    The exact inverse matching `acquire_with_motion`'s corruption for `kind`:
+    per-row for Cartesian and the others, per-spoke for radial. The spoke
+    index map is deterministic, so rebuilding it here gives exactly the one
+    the corruption used.
+    """
+    if kind != "radial":
+        return mcorr.undo_motion
+    index_map = spoke_index_map(tuple(shape), ratio)
+    return lambda kspace, displacements: mcorr.undo_motion_radial(
+        kspace, index_map, displacements
+    )
+
+
+@st.cache_data(show_spinner=False)
+def run_autofocus(
+    sample_id: str,
+    kind: str,
+    ratio: float,
+    model: str,
+    amp: float,
+    at_frac: float,
+    cycles: float,
+    snr_db: float | None,
+    seed: int,
+):
+    """
+    Estimate the motion from the corrupted scan alone and undo it.
+
+    The true displacements returned by `acquire_with_motion` are used only
+    for their COUNT (rows or spokes); autofocus never sees their values.
+
+    Returns (AutofocusResult, corrected reconstruction, metrics).
+    """
+    image, _, _, _ = load_sample(sample_id)
+    _, acquired, _, _, displacements = acquire_with_motion(
+        sample_id, kind, ratio, model, amp, at_frac, cycles, snr_db, seed
+    )
+    undo = motion_undo(kind, image.shape, ratio)
+    result = mcorr.autofocus(acquired, model, len(displacements), undo)
+    corrected = ks.from_kspace(undo(acquired, result.displacements))
+    return result, corrected, metrics.compute_metrics(image, corrected)
 
 
 def build_displacements(
@@ -649,6 +701,88 @@ with tabs[2]:
             "true black."
         )
 
+    # --- Denoising ----------------------------------------------------------
+    # Applied to the noisy *fully sampled* image, so what is removed is noise
+    # alone, not undersampling artifacts. See mri_sim/denoise.py.
+    ui.rule()
+    st.subheader("Taking the noise back out")
+    ui.lede(
+        "Anatomy is carried by a **few large** wavelet coefficients; white noise "
+        "spreads into **many small** ones. Soft thresholding shrinks every "
+        "coefficient toward zero and drops the small ones, removing grain while "
+        "keeping edges. The denoiser is **not told** the noise level: it "
+        "estimates it from the noisy image, as a real scanner would have to."
+    )
+
+    denoise_on = st.checkbox("Denoise the noisy image", value=True, key="denoise_on")
+    strength = st.slider(
+        "Denoising strength", min_value=0.0, max_value=2.0, value=1.0, step=0.1,
+        key="denoise_strength", disabled=not denoise_on,
+        help="Scales the estimated noise level that sets the thresholds. 1.0 is "
+             "the textbook setting; higher removes more noise and more detail.",
+    )
+
+    if denoise_on:
+        estimated_sigma = denoise.estimate_noise_sigma(noisy_recon)
+        denoised = denoise.wavelet_denoise(noisy_recon, strength=strength)
+        removed = denoise.residual(noisy_recon, denoised)
+
+        # The true image-domain noise level, which only a simulator can know.
+        # numpy's ifft2 divides by N, so white noise of per-channel sigma in
+        # k-space becomes per-channel sigma / sqrt(N) in the image.
+        true_sigma = noise.noise_sigma_for_snr(full_kspace, demo_snr) / np.sqrt(
+            full_kspace.size
+        )
+
+        ui.figure(
+            [
+                ui.panel(noisy_recon, "Noisy, fully sampled"),
+                ui.panel(denoised, f"Wavelet denoised (strength {strength:.1f})"),
+                ui.panel(removed, "Removed: noisy − denoised", stretch=True),
+            ],
+            caption=(
+                "Wavelet soft-thresholding (BayesShrink) applied to "
+                "(a). Panel (c) is contrast-stretched with zero at mid-grey. "
+                "Featureless grain means only noise was removed; visible anatomy "
+                "means real detail was removed too."
+            ),
+            number="3b",
+        )
+
+        noisy_scores = metrics.compute_metrics(image, noisy_recon)
+        denoised_scores = metrics.compute_metrics(image, denoised)
+        left, right = st.columns(2, gap="medium")
+        with left:
+            ui.metrics_table(noisy_scores, caption="Noisy")
+        with right:
+            ui.metrics_table(
+                denoised_scores, baseline=noisy_scores,
+                caption="Denoised (change vs noisy)",
+            )
+
+        ui.note(
+            f"Noise level: estimated σ = {estimated_sigma:.4f} from the image alone; "
+            f"true σ = {true_sigma:.4f} (known only because this is a simulation)."
+        )
+
+        if denoised_scores["psnr"] < noisy_scores["psnr"]:
+            ui.remark(
+                "Denoising made this image *worse*. At high SNR there is little "
+                "noise to remove, and fine texture in the finest wavelet band can "
+                "be mistaken for noise, so the estimate runs high and real detail "
+                "is smoothed away. Look for anatomy in panel (c), or lower the "
+                "strength.",
+                kind="caution",
+            )
+        else:
+            ui.remark(
+                "Denoising helps most when noise is heavy. Push the strength past "
+                "~1.5 and PSNR usually falls again: the thresholds start eating "
+                "real edges and texture. There is no free lunch, only a trade-off "
+                "between grain and blur.",
+                kind="result",
+            )
+
 # ---------------------------------------------------------------------------
 # Tab 4: compressed sensing
 # ---------------------------------------------------------------------------
@@ -912,6 +1046,134 @@ with tabs[5]:
                 "are zeroed anyway), but the jerk position above is nominal, not exact.",
                 kind="note",
             )
+
+    # --- Motion correction ----------------------------------------------------
+    # See mri_sim/motion_correction.py. Motion only changed PHASE, so undoing
+    # it is exact once the displacements are known; the question is how to
+    # know them.
+    ui.rule()
+    st.subheader("Correcting the motion")
+    ui.lede(
+        "Motion only rotated the **phase** of each row or spoke, so nothing was "
+        "destroyed: multiplying by the opposite phase ramp puts every sample "
+        "back. The hard part is knowing the motion. **(b)** uses the true "
+        "displacements, as a scanner's navigator echoes or optical tracker would "
+        "supply. **(c)** uses **autofocus**: it sees only the corrupted data, "
+        "tries candidate motions of the chosen type, and keeps the one that "
+        "makes the image sharpest (lowest gradient entropy)."
+    )
+
+    if motion_model == "none" or motion_amp == 0.0:
+        ui.note("Pick a motion model and a non-zero amplitude above to correct it.")
+    else:
+        undo = motion_undo(strategy, image.shape, ratio)
+        oracle_recon = ks.from_kspace(undo(acquired_m, displacements))
+        oracle_scores = metrics.compute_metrics(image, oracle_recon)
+
+        autofocus_key = (
+            sample_id, strategy, ratio, motion_model, motion_amp, jerk_at,
+            motion_cycles, snr_db, int(seed),
+        )
+        requested = st.session_state.setdefault("autofocus_requested", set())
+        if st.button(
+            "Run autofocus",
+            help="Estimates the motion from the corrupted scan alone. Takes "
+                 "0.2 s (drift) to ~5 s (periodic, radial); results are "
+                 "cached, so returning to the same settings is instant.",
+        ):
+            requested.add(autofocus_key)
+
+        autofocus = None
+        if autofocus_key in requested:
+            with st.spinner("Searching for the motion that makes the image sharpest..."):
+                autofocus, auto_recon, auto_scores = run_autofocus(*autofocus_key)
+
+        if autofocus is None:
+            panels = [
+                ui.panel(recon_m, "With motion"),
+                ui.panel(oracle_recon, "Corrected, true motion (oracle)"),
+            ]
+            caption = (
+                "Motion correction. (b) undoes the true displacements exactly. "
+                "Press **Run autofocus** to estimate them from (a) alone."
+            )
+        else:
+            panels = [
+                ui.panel(recon_m, "With motion"),
+                ui.panel(oracle_recon, "Corrected, true motion (oracle)"),
+                ui.panel(auto_recon, "Corrected, estimated motion (autofocus)"),
+                error_panel(image, auto_recon, "Autofocus error"),
+            ]
+            caption = (
+                "Motion correction. (b) undoes the true displacements; (c) undoes "
+                "the displacements autofocus estimated from (a) alone; (d) is the "
+                "absolute error of (c). With undersampling or noise, the best any "
+                "correction can reach is the no-motion reconstruction of Figure 7(b)."
+            )
+        ui.figure(panels, caption=caption, number="8b")
+
+        columns = st.columns(4, gap="medium")
+        with columns[0]:
+            ui.metrics_table(scores_m, caption="With motion")
+        with columns[1]:
+            ui.metrics_table(oracle_scores, baseline=scores_m, caption="Oracle (vs motion)")
+        if autofocus is not None:
+            with columns[2]:
+                ui.metrics_table(auto_scores, baseline=scores_m, caption="Autofocus (vs motion)")
+
+        if autofocus is not None:
+            n_events = len(displacements)
+            axis = "Spoke index" if strategy == "radial" else "k-space row"
+            left, right = st.columns([3, 2], gap="large")
+            with left:
+                ui.line_chart(
+                    pd.DataFrame({
+                        "event": np.tile(np.arange(n_events), 2),
+                        "dy": [dy for dy, _ in displacements]
+                              + [dy for dy, _ in autofocus.displacements],
+                        "series": ["True motion"] * n_events
+                                  + ["Autofocus estimate"] * n_events,
+                    }),
+                    x="event", y="dy", series="series",
+                    x_title=f"{axis} (acquisition time)", y_title="dy (pixels)",
+                    points=False, height=260,
+                )
+                ui.caption(
+                    "True patient position against the position autofocus "
+                    "inferred from the corrupted data.",
+                    number="8c",
+                )
+            with right:
+                truth = {"amp": f"{motion_amp:g} px"}
+                if motion_model == "sudden_jerk":
+                    truth["at"] = f"event {int(round(jerk_at * n_events))}"
+                if motion_model == "periodic":
+                    truth["cycles"] = f"{motion_cycles:g}"
+                found = autofocus.params
+                units = {"amp": " px", "cycles": ""}
+                ui.table(
+                    ["Parameter", "True", "Estimated"],
+                    [
+                        (name, truth[name],
+                         f"event {found[name]}" if name == "at"
+                         else f"{found[name]:g}{units[name]}")
+                        for name in truth
+                    ],
+                    caption=(
+                        f"{autofocus.n_evaluations} candidate images tried; "
+                        f"gradient entropy {autofocus.initial_score:.3f} → "
+                        f"{autofocus.score:.3f}"
+                    ),
+                )
+                ui.remark(
+                    "Autofocus is told the motion **type** but not its size or "
+                    "timing. A shift of the whole scan is invisible (the shift "
+                    "theorem again), so only motion *relative* to the start of "
+                    "the scan can be recovered. Very large, fast breathing "
+                    "(~25 px at ~20 cycles) can fall between the search's grid "
+                    "points; the oracle still fixes it.",
+                    kind="note",
+                )
 
     with st.expander("Cartesian ghosts vs radial streaks", expanded=False):
         st.markdown(
